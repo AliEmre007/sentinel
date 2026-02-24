@@ -1,0 +1,30 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: sentinel-db
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  api:
+    build: .
+    container_name: sentinel-api
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      # We pass the full connection string into the Go container's memory
+      DATABASE_URL: ${DATABASE_URL}
+    volumes:
+      - .:/app
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
