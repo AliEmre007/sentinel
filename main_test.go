@@ -8,7 +8,7 @@ import (
 
 // Unit Test: Tests the pure business logic
 func TestGenerateShortCode(t *testing.T) {
-	expectedLength := 6
+	expectedLength := 99
 	code1 := generateShortCode(expectedLength)
 	code2 := generateShortCode(expectedLength)
 
