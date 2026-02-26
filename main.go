@@ -1,163 +1,158 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"log"
-	"math/rand/v2"
+	"math/rand"
 	"net/http"
 	"os"
+	"time"
 
 	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 )
 
-// db holds the global database connection pool.
 var db *sql.DB
+var rdb *redis.Client
+var ctx = context.Background() // Required by Redis for managing connection timeouts
 
-// ---------------------------------------------------------
-// DATA MODELS
-// ---------------------------------------------------------
 type ShortenRequest struct {
 	OriginalURL string `json:"original_url"`
 }
 
 type ShortenResponse struct {
-	ShortCode   string `json:"short_code"`
-	OriginalURL string `json:"original_url"`
+	ShortCode string `json:"short_code"`
 }
 
 // ---------------------------------------------------------
-// CORE LOGIC FUNCTIONS
+// INFRASTRUCTURE INITIALIZATION
 // ---------------------------------------------------------
 
-// generateShortCode creates a random alphanumeric string.
+func initDB() {
+	connStr := os.Getenv("DATABASE_URL")
+	var err error
+	db, err = sql.Open("postgres", connStr)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS urls (
+		id SERIAL PRIMARY KEY,
+		short_code VARCHAR(10) UNIQUE NOT NULL,
+		original_url TEXT NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	)`)
+	if err != nil {
+		log.Fatalf("Failed to create table: %v", err)
+	}
+	log.Println("Connected to PostgreSQL successfully!")
+}
+
+func initRedis() {
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		redisURL = "localhost:6379"
+	}
+	
+	rdb = redis.NewClient(&redis.Options{
+		Addr: redisURL,
+	})
+	
+	// Test the connection
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Fatalf("Failed to connect to Redis: %v", err)
+	}
+	log.Println("Connected to Redis successfully!")
+}
+
+// ---------------------------------------------------------
+// BUSINESS LOGIC
+// ---------------------------------------------------------
+
 func generateShortCode(length int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, length)
-	for i := range b {
-		b[i] = charset[rand.IntN(len(charset))] 
+	code := make([]byte, length)
+	for i := range code {
+		code[i] = charset[rand.Intn(len(charset))]
 	}
-	return string(b)
+	return string(code)
 }
 
-// handleShorten processes POST requests to create new short links.
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Sentinel API is Live with Redis! 🚀\n"))
+}
+
 func handleShorten(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		return
+	}
+
 	var req ShortenRequest
-	
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.OriginalURL == "" {
-		http.Error(w, "Invalid request payload. 'original_url' is required.", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
 		return
 	}
 
 	shortCode := generateShortCode(6)
 
-	// BEST PRACTICE: Parameterized query to prevent SQL injection.
-	insertSQL := `INSERT INTO urls (short_code, original_url) VALUES ($1, $2)`
-	_, err := db.Exec(insertSQL, shortCode, req.OriginalURL)
+	_, err := db.Exec("INSERT INTO urls (short_code, original_url) VALUES ($1, $2)", shortCode, req.OriginalURL)
 	if err != nil {
-		log.Printf("Database error: %v", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		http.Error(w, "Failed to save to database", http.StatusInternalServerError)
 		return
 	}
 
-	resp := ShortenResponse{
-		ShortCode:   shortCode,
-		OriginalURL: req.OriginalURL,
-	}
-	
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(ShortenResponse{ShortCode: shortCode})
 }
 
-// handleRedirect processes GET requests and forwards the user to the original URL.
+// THE NEW CACHE-ASIDE REDIRECT HANDLER
 func handleRedirect(w http.ResponseWriter, r *http.Request) {
-	// BEST PRACTICE: Modern Go 1.22 routing safely extracts the variable from the URL.
-	shortCode := r.PathValue("code")
-	if shortCode == "" {
-		http.Error(w, "Short code is missing", http.StatusBadRequest)
+	shortCode := r.URL.Path[1:]
+
+	// 1. Check Redis First (Memory is fast)
+	cachedURL, err := rdb.Get(ctx, shortCode).Result()
+	if err == nil {
+		log.Printf("⚡ CACHE HIT for %s", shortCode)
+		http.Redirect(w, r, cachedURL, http.StatusFound)
 		return
 	}
 
+	// 2. Cache Miss! Query PostgreSQL (Disk is slow)
+	log.Printf("🐢 CACHE MISS for %s. Querying PostgreSQL...", shortCode)
 	var originalURL string
-	querySQL := `SELECT original_url FROM urls WHERE short_code = $1`
+	err = db.QueryRow("SELECT original_url FROM urls WHERE short_code = $1", shortCode).Scan(&originalURL)
 	
-	err := db.QueryRow(querySQL, shortCode).Scan(&originalURL)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			// If the code doesn't exist in the DB, return our custom 404.
-			http.Error(w, "404 - URL not found in Sentinel", http.StatusNotFound)
-			return
+			http.Error(w, "URL not found", http.StatusNotFound)
+		} else {
+			http.Error(w, "Database error", http.StatusInternalServerError)
 		}
-		log.Printf("Database error during redirect lookup: %v", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
-	// BEST PRACTICE: Perform the physical HTTP 302 Redirect
+	// 3. Save to Redis for the next person (Expires in 24 hours)
+	err = rdb.Set(ctx, shortCode, originalURL, 24*time.Hour).Err()
+	if err != nil {
+		log.Printf("Warning: Failed to cache %s: %v", shortCode, err)
+	}
+
+	// 4. Redirect the user
 	http.Redirect(w, r, originalURL, http.StatusFound)
-}
-
-// handleHealth provides a simple status check for the API.
-func handleHealth(w http.ResponseWriter, r *http.Request) {
-    fmt.Fprintf(w, "Sentinel API is Live Reloading! 🚀")
-}
-
-// ---------------------------------------------------------
-// INITIALIZATION & ROUTING
-// ---------------------------------------------------------
-
-// initDB initializes the PostgreSQL connection and creates the table if missing.
-func initDB() {
-	var err error
-	
-	// BEST PRACTICE: Read secrets from the environment, never from the code.
-	connStr := os.Getenv("DATABASE_URL")
-	
-	// BEST PRACTICE: Fail-Fast. If the DevOps engineer forgot to set the .env file, 
-	// crash immediately with a clear error message.
-	if connStr == "" {
-		log.Fatal("CRITICAL: DATABASE_URL environment variable is not set!")
-	}
-	
-	db, err = sql.Open("postgres", connStr)
-	if err != nil {
-		log.Fatal("Failed to allocate DB pool: ", err)
-	}
-
-	if err = db.Ping(); err != nil {
-		log.Fatal("Database is unreachable: ", err)
-	}
-
-	createTableSQL := `
-	CREATE TABLE IF NOT EXISTS urls (
-		id SERIAL PRIMARY KEY,
-		short_code VARCHAR(10) UNIQUE NOT NULL,
-		original_url TEXT NOT NULL,
-		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-	);`
-
-	_, err = db.Exec(createTableSQL)
-	if err != nil {
-		log.Fatal("Failed to create 'urls' table: ", err)
-	}
-	fmt.Println("Database connected & 'urls' table verified! 🟢")
 }
 
 func main() {
 	initDB()
-	defer db.Close()
+	initRedis() // Boot up the cache
 
-	// BEST PRACTICE: Exactly one handler per route pattern
-	http.HandleFunc("GET /health", handleHealth)
-	http.HandleFunc("POST /shorten", handleShorten)
-	http.HandleFunc("GET /{code}", handleRedirect)
+	http.HandleFunc("/health", handleHealth)
+	http.HandleFunc("/shorten", handleShorten)
+	http.HandleFunc("/", handleRedirect)
 
-	fmt.Println("Sentinel Server starting on port 8080...")
-	
-	err := http.ListenAndServe(":8080", nil)
-	if err != nil {
-		log.Fatal("Error starting server: ", err)
-	}
+	log.Println("Server starting on :8080...")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
