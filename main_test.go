@@ -12,7 +12,7 @@ func TestGenerateShortCode(t *testing.T) {
 	code1 := generateShortCode(expectedLength)
 	code2 := generateShortCode(expectedLength)
 
-	if len(code1) != 99 || code1 == code2 {
+	if len(code1) expectedLenght || len(code1) == len(code2) {
 		t.Errorf("Failed length check. Got %d ", len(code1))
 	}
 	if code1 == code2 {
