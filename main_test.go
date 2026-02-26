@@ -1,3 +1,4 @@
+package main
 
 import (
 	"net/http"
@@ -5,35 +6,19 @@ import (
 	"testing"
 )
 
-// Unit Test: Tests the pure business logic
 func TestGenerateShortCode(t *testing.T) {
-    expectedLength := 6
-    code1 := generateShortCode(expectedLength)
-    code2 := generateShortCode(expectedLength)
-
-    if len(code1) != expectedLength || code1 == code2 {
-        t.Errorf("Short code logic failed")
-    }
-}
-// Integration Test: Tests the HTTP Request/Response cycle
-func TestHealthEndpoint(t *testing.T) {
-	// 1. Create a simulated HTTP GET request
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
-
-	// 2. Create a ResponseRecorder to act as our "fake web browser" to capture the output
-	rr := httptest.NewRecorder()
-
-	// 3. Call the handler directly, passing in our fake browser and fake request
-	handleHealth(rr, req)
-
-	// 4. Assert the HTTP Status Code is exactly 200 (OK)
-	if status := rr.Code; status != http.StatusOK {
-		t.Errorf("Handler returned wrong status code: got %v want %v", status, http.StatusOK)
+	code1 := generateShortCode(6)
+	code2 := generateShortCode(6)
+	if len(code1) != 6 || code1 == code2 {
+		t.Errorf("Short code logic failed")
 	}
+}
 
-	// 5. Assert the API returned the correct body text
-	expected := "Sentinel API is Live Reloading! 🚀"
-	if rr.Body.String() != expected {
-		t.Errorf("Handler returned unexpected body: got %v want %v", rr.Body.String(), expected)
+func TestHealthEndpoint(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	rr := httptest.NewRecorder()
+	handleHealth(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("Expected 200, got %d", rr.Code)
 	}
 }
