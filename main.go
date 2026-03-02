@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -16,20 +17,45 @@ import (
 
 var db *sql.DB
 var rdb *redis.Client
-var ctx = context.Background() // Required by Redis for managing connection timeouts
+var ctx = context.Background()
 
-type ShortenRequest struct {
-	OriginalURL string `json:"original_url"`
-}
+// ---------------------------------------------------------
+// 🛡️ THE LUA SCRIPT (Token Bucket Algorithm)
+// ---------------------------------------------------------
+const tokenBucketScript = `
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
 
-type ShortenResponse struct {
-	ShortCode string `json:"short_code"`
-}
+local bucket = redis.call("HMGET", key, "tokens", "last_refill")
+local tokens = tonumber(bucket[1])
+local last_refill = tonumber(bucket[2])
+
+if not tokens then
+    tokens = capacity
+    last_refill = now
+else
+    local time_passed = now - last_refill
+    local new_tokens = math.floor(time_passed * refill_rate)
+    tokens = math.min(capacity, tokens + new_tokens)
+    if new_tokens > 0 then
+        last_refill = now
+    end
+end
+
+if tokens >= 1 then
+    redis.call("HMSET", key, "tokens", tokens - 1, "last_refill", last_refill)
+    redis.call("EXPIRE", key, 60)
+    return 1
+else
+    return 0
+end
+`
 
 // ---------------------------------------------------------
 // INFRASTRUCTURE INITIALIZATION
 // ---------------------------------------------------------
-
 func initDB() {
 	connStr := os.Getenv("DATABASE_URL")
 	var err error
@@ -60,16 +86,11 @@ func initRedis() {
 		Addr: redisURL,
 	})
 	
-	// Test the connection
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		log.Fatalf("Failed to connect to Redis: %v", err)
 	}
 	log.Println("Connected to Redis successfully!")
 }
-
-// ---------------------------------------------------------
-// BUSINESS LOGIC
-// ---------------------------------------------------------
 
 func generateShortCode(length int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -80,9 +101,20 @@ func generateShortCode(length int) string {
 	return string(code)
 }
 
+// ---------------------------------------------------------
+// BUSINESS LOGIC
+// ---------------------------------------------------------
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Sentinel API is Live with Redis! 🚀\n"))
+	w.Write([]byte("Sentinel API is Live with Redis and Rate Limiting! 🚀\n"))
+}
+
+type ShortenRequest struct {
+	OriginalURL string `json:"original_url"`
+}
+
+type ShortenResponse struct {
+	ShortCode string `json:"short_code"`
 }
 
 func handleShorten(w http.ResponseWriter, r *http.Request) {
@@ -109,11 +141,9 @@ func handleShorten(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(ShortenResponse{ShortCode: shortCode})
 }
 
-// THE NEW CACHE-ASIDE REDIRECT HANDLER
 func handleRedirect(w http.ResponseWriter, r *http.Request) {
 	shortCode := r.URL.Path[1:]
 
-	// 1. Check Redis First (Memory is fast)
 	cachedURL, err := rdb.Get(ctx, shortCode).Result()
 	if err == nil {
 		log.Printf("⚡ CACHE HIT for %s", shortCode)
@@ -121,7 +151,6 @@ func handleRedirect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Cache Miss! Query PostgreSQL (Disk is slow)
 	log.Printf("🐢 CACHE MISS for %s. Querying PostgreSQL...", shortCode)
 	var originalURL string
 	err = db.QueryRow("SELECT original_url FROM urls WHERE short_code = $1", shortCode).Scan(&originalURL)
@@ -135,24 +164,57 @@ func handleRedirect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Save to Redis for the next person (Expires in 24 hours)
 	err = rdb.Set(ctx, shortCode, originalURL, 24*time.Hour).Err()
 	if err != nil {
 		log.Printf("Warning: Failed to cache %s: %v", shortCode, err)
 	}
 
-	// 4. Redirect the user
 	http.Redirect(w, r, originalURL, http.StatusFound)
+}
+
+// ---------------------------------------------------------
+// 🛡️ THE MIDDLEWARE (The Bouncer)
+// ---------------------------------------------------------
+func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ip, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			ip = r.RemoteAddr
+		}
+		
+		bucketKey := "rate_limit:" + ip
+		capacity := 5      // Maximum burst of 5 requests
+		refillRate := 1    // Refill 1 token per second
+		now := time.Now().Unix()
+
+		result, err := rdb.Eval(ctx, tokenBucketScript, []string{bucketKey}, capacity, refillRate, now).Result()
+		if err != nil {
+			log.Printf("Rate limiter error: %v", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+
+		if result.(int64) == 0 {
+			log.Printf("🛑 BLOCKED: %s is making too many requests!", ip)
+			http.Error(w, "429 Too Many Requests - Slow down!", http.StatusTooManyRequests)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	}
 }
 
 func main() {
 	initDB()
-	initRedis() // Boot up the cache
+	initRedis()
 
 	http.HandleFunc("/health", handleHealth)
-	http.HandleFunc("/shorten", handleShorten)
+	
+	// We cast handleShorten to an http.HandlerFunc so the Go compiler accepts it into the middleware
+	http.HandleFunc("/shorten", rateLimitMiddleware(http.HandlerFunc(handleShorten)))
+	
 	http.HandleFunc("/", handleRedirect)
 
-	log.Println("Server starting on :8080...")
+	log.Println("Sentinel Server starting on port 8080...")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
